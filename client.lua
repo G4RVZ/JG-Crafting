@@ -1,0 +1,1335 @@
+-- JG-Crafting/client.lua (cleaned + optimized)
+local QBCore = exports['qb-core']:GetCoreObject()
+
+-- ======================
+-- RESOURCE DETECTION
+-- ======================
+local function HasRes(res) return GetResourceState(res) == 'started' end
+
+local HAS_OX_INV    = HasRes('ox_inventory')
+local HAS_OX_LIB    = HasRes('ox_lib')
+local HAS_OX_TARGET = HasRes('ox_target')
+
+-- ox_lib exposes global `lib` when running; keep a safe handle
+local OX = (HAS_OX_LIB and _G.lib) or nil
+
+-- ======================
+-- SYSTEM DETECTION (Config override aware)
+-- ======================
+local function ResolveSystem(name)
+    local pref = (Config.Systems and Config.Systems[name]) or 'auto'
+    pref = tostring(pref):lower()
+
+    if pref ~= 'auto' then
+        return pref -- 'qb' or 'ox'
+    end
+
+    if name == 'Target' then
+        return HAS_OX_TARGET and 'ox' or 'qb'
+    end
+
+    if name == 'Inventory' then
+        return HAS_OX_INV and 'ox' or 'qb'
+    end
+
+    -- Menu/Input/Progress default to ox if ox_lib is running, otherwise qb
+    return HAS_OX_LIB and 'ox' or 'qb'
+end
+
+local MenuSystem      = ResolveSystem('Menu')
+local InputSystem     = ResolveSystem('Input')
+local ProgressSystem  = ResolveSystem('Progress')
+local TargetSystem    = ResolveSystem('Target')
+local InventorySystem = ResolveSystem('Inventory')
+
+-- Admin menu can be forced separately; defaults to MenuSystem if not explicitly set
+local AdminMenuSystem = (Config.Systems and Config.Systems.AdminMenu and tostring(Config.Systems.AdminMenu):lower()) or 'auto'
+if AdminMenuSystem == 'auto' then
+    AdminMenuSystem = MenuSystem
+end
+
+-- ======================
+-- STATE
+-- ======================
+local benches = {}
+local spawned = {}
+
+local placing = false
+local placingObj = nil
+local placingHeading = 0.0
+
+local menuOpen = false
+local activeBenchType = nil
+local activeBenchId = nil
+
+local previewProp = nil
+
+local craftingQueue = {}
+local isCrafting = false
+
+local isAdmin = false
+
+-- camera
+local previewCam = nil
+local camActive = false
+local camBenchId = nil
+local lastCamInterp = 500
+
+-- local hide loop state
+local hiddenLoopRunning = false
+
+-- ======================
+-- ADMIN STATE
+-- ======================
+local function RefreshAdmin()
+    TriggerServerEvent('JG-Crafting:server:CheckAdmin')
+end
+
+RegisterNetEvent('QBCore:Client:OnPlayerLoaded', RefreshAdmin)
+RegisterNetEvent('QBCore:Client:OnJobUpdate', RefreshAdmin)
+
+RegisterNetEvent('JG-Crafting:client:SetAdmin', function(state)
+    isAdmin = (state == true)
+end)
+
+CreateThread(function()
+    Wait(1500)
+    RefreshAdmin()
+end)
+
+-- ======================
+-- UTILS
+-- ======================
+local function LoadModel(model)
+    model = (type(model) == 'number') and model or joaat(model)
+    if HasModelLoaded(model) then return true end
+
+    RequestModel(model)
+    local timeout = GetGameTimer() + 5000
+    while not HasModelLoaded(model) do
+        if GetGameTimer() > timeout then return false end
+        Wait(0)
+    end
+    return true
+end
+
+local function SnapObjectToGround(obj)
+    if not DoesEntityExist(obj) then return end
+    FreezeEntityPosition(obj, false)
+    PlaceObjectOnGroundProperly(obj)
+    FreezeEntityPosition(obj, true)
+end
+
+local function GetLocalItemCount(item)
+    -- ox_inventory path
+    if InventorySystem == 'ox' and HasRes('ox_inventory') then
+        local result = exports.ox_inventory:Search('count', item)
+
+        -- Some versions/cases can return a table; normalize to a number
+        if type(result) == 'table' then
+            local total = 0
+            for _, v in pairs(result) do
+                if type(v) == 'number' then
+                    total = total + v
+                elseif type(v) == 'table' then
+                    total = total + (tonumber(v.count) or tonumber(v.amount) or 0)
+                end
+            end
+            return total
+        end
+
+        return tonumber(result) or 0
+    end
+
+    -- qb inventory path
+    local pData = QBCore.Functions.GetPlayerData()
+    local items = (pData and pData.items) or {}
+
+    for _, it in pairs(items) do
+        if it and it.name == item then
+            return tonumber(it.amount) or 0
+        end
+    end
+
+    return 0
+end
+
+local function CanCraftItem(def)
+    local req = def and def.requires or {}
+    for reqItem, amount in pairs(req) do
+        local need = tonumber(amount) or 0
+        if need > 0 and GetLocalItemCount(reqItem) < need then
+            return false
+        end
+    end
+    return true
+end
+
+local function CanDismantleItem(def)
+    if not def or not def.name then return false end
+    local need = tonumber(def.removeAmount) or 1
+    if need < 1 then need = 1 end
+    return GetLocalItemCount(def.name) >= need
+end
+
+local function GetCraftAnimForSystem()
+    local c = Config.Crafting or {}
+
+    -- qb-progressbar expects: { animDict = '', anim = '', flags = 49 }
+    if ProgressSystem ~= 'ox' then
+        return c
+    end
+
+    -- ox_lib expects: { dict = '', clip = '', flag = 49 }
+    local dict = c.dict or c.animDict
+    local clip = c.clip or c.anim
+    local flag = c.flag or c.flags or 49
+
+    if not dict or not clip then return nil end
+    return { dict = dict, clip = clip, flag = flag }
+end
+
+-- ======================
+-- PLAYER VISIBILITY (LOCAL ONLY)
+-- ======================
+local function ShowLocalPlayer()
+    local ped = PlayerPedId()
+    SetPlayerInvisibleLocally(PlayerId(), false)
+    ResetEntityAlpha(ped)
+    SetEntityVisible(ped, true, false)
+end
+
+local function EnsureHiddenLoop()
+    if hiddenLoopRunning then return end
+    hiddenLoopRunning = true
+
+    CreateThread(function()
+        while (menuOpen or camActive) do
+            local ped = PlayerPedId()
+            SetEntityLocallyInvisible(ped)
+            SetPlayerInvisibleLocally(PlayerId(), true)
+            Wait(0)
+        end
+
+        ShowLocalPlayer()
+        hiddenLoopRunning = false
+    end)
+end
+
+local function HideLocalPlayer()
+    local ped = PlayerPedId()
+    SetEntityVisible(ped, false, false)
+    SetEntityAlpha(ped, 0, false)
+    SetPlayerInvisibleLocally(PlayerId(), true)
+    EnsureHiddenLoop()
+end
+
+-- ======================
+-- RAYCAST FROM CAMERA (for placement)
+-- ======================
+local function RotationToDirection(rot)
+    local z = math.rad(rot.z)
+    local x = math.rad(rot.x)
+    local num = math.abs(math.cos(x))
+    return vector3(-math.sin(z) * num, math.cos(z) * num, math.sin(x))
+end
+
+local function RaycastFromCamera(distance)
+    local camRot = GetGameplayCamRot(2)
+    local camPos = GetGameplayCamCoord()
+    local dir = RotationToDirection(camRot)
+    local dest = camPos + (dir * (distance or 10.0))
+
+    local ray = StartShapeTestRay(
+        camPos.x, camPos.y, camPos.z,
+        dest.x, dest.y, dest.z,
+        -1, PlayerPedId(), 0
+    )
+
+    local _, hit, endCoords = GetShapeTestResult(ray)
+    return hit == 1, endCoords
+end
+
+-- ======================
+-- PREVIEW PROP
+-- ======================
+local function RemovePreviewProp()
+    if previewProp and DoesEntityExist(previewProp) then
+        DeleteEntity(previewProp)
+    end
+    previewProp = nil
+end
+
+local function SpawnPreviewPropOnBench(benchEntity, preview)
+    RemovePreviewProp()
+    if not preview or not preview.model then return end
+    if not DoesEntityExist(benchEntity) then return end
+    if not LoadModel(preview.model) then return end
+
+    previewProp = CreateObject(joaat(preview.model), 0.0, 0.0, 0.0, false, false, false)
+    if not DoesEntityExist(previewProp) then
+        previewProp = nil
+        return
+    end
+
+    SetEntityCollision(previewProp, false, false)
+    SetEntityInvincible(previewProp, true)
+    FreezeEntityPosition(previewProp, true)
+
+    local off = preview.offset or vector3(0.0, 0.0, 1.0)
+    local baseRot = preview.rotation or vector3(0.0, 0.0, 0.0)
+
+    local function Attach(rotZ)
+        AttachEntityToEntity(
+            previewProp, benchEntity, 0,
+            off.x, off.y, off.z,
+            baseRot.x, baseRot.y, baseRot.z + (rotZ or 0.0),
+            false, false, false, false, 2, true
+        )
+    end
+
+    Attach(0.0)
+
+    if preview.rotate == nil or preview.rotate == true then
+        CreateThread(function()
+            local h = 0.0
+            local speed = 0.6
+            if Config.Preview and Config.Preview.rotateSpeed then
+                speed = tonumber(Config.Preview.rotateSpeed) or speed
+            end
+
+            while menuOpen and previewProp and DoesEntityExist(previewProp) and DoesEntityExist(benchEntity) do
+                h = (h + speed) % 360.0
+                Attach(h)
+                Wait(0)
+            end
+
+            RemovePreviewProp()
+        end)
+    end
+end
+
+-- ======================
+-- PREVIEW CAMERA
+-- ======================
+local function StopPreviewCam()
+    if previewCam then
+        SetCamActive(previewCam, false)
+    end
+
+    -- hard stop scripted cams
+    RenderScriptCams(false, false, 0, true, true)
+    DestroyAllCams(true)
+
+    previewCam = nil
+    camActive = false
+    camBenchId = nil
+
+    ClearFocus()
+    ShowLocalPlayer()
+end
+
+-- ======================
+-- FORCE STOP PREVIEW CAM ON ESC (while menu is open)
+-- ======================
+CreateThread(function()
+    while true do
+        if not menuOpen then
+            Wait(250)
+        else
+            Wait(0)
+
+            -- ESC / Pause keys (covers most setups)
+            if IsControlJustPressed(0, 322) or IsControlJustPressed(0, 200) then
+                -- Only kill the cam (do NOT HardCleanup here unless you want full cleanup)
+                StopPreviewCam()
+
+                -- Optional: also remove preview prop when escaping
+                RemovePreviewProp()
+
+                -- Prevent double-trigger if key is held
+                Wait(250)
+            end
+        end
+    end
+end)
+
+local function StartPreviewCam(benchEntity, focusEntity)
+    if not Config.PreviewCam or Config.PreviewCam.enabled == false then return end
+    if not DoesEntityExist(benchEntity) then return end
+
+    StopPreviewCam()
+
+    local cfg = Config.PreviewCam.default or {}
+    if activeBenchType and Config.PreviewCam[activeBenchType] then
+        cfg = Config.PreviewCam[activeBenchType]
+    end
+
+    local fov     = cfg.fov or 45.0
+    local interp  = cfg.interpMs or 650
+    local camOff  = cfg.offset or vector3(0.0, -1.25, 0.90)
+    local lookOff = cfg.lookAtOffset or vector3(0.0, 0.0, 0.12)
+
+    lastCamInterp = interp
+
+    previewCam = CreateCam('DEFAULT_SCRIPTED_CAMERA', true)
+    SetCamFov(previewCam, fov)
+
+    local camPos = GetOffsetFromEntityInWorldCoords(benchEntity, camOff.x, camOff.y, camOff.z)
+    SetCamCoord(previewCam, camPos.x, camPos.y, camPos.z)
+
+    local target = (focusEntity and DoesEntityExist(focusEntity)) and focusEntity or benchEntity
+    local tPos = GetEntityCoords(target)
+    PointCamAtCoord(previewCam, tPos.x + lookOff.x, tPos.y + lookOff.y, tPos.z + lookOff.z)
+
+    SetCamActive(previewCam, true)
+    RenderScriptCams(true, true, interp, true, true)
+    camActive = true
+
+    HideLocalPlayer()
+end
+
+-- ======================
+-- MENU HELPERS
+-- ======================
+local function CloseMenuUI()
+    if MenuSystem == 'ox' and OX then
+        OX.hideContext()
+        return
+    end
+
+    if HasRes('qb-menu') then
+        exports['qb-menu']:closeMenu()
+    end
+end
+
+local function ForceCloseAnyMenu()
+    if HasRes('qb-menu') then
+        exports['qb-menu']:closeMenu()
+    end
+    if OX then
+        OX.hideContext()
+    end
+end
+
+local function OpenMenu(menu)
+    if MenuSystem == 'ox' and OX then
+        local options = {}
+        local title = (menu[1] and menu[1].header) or 'Menu'
+
+        for i = 2, #menu do
+            local row = menu[i]
+            options[#options + 1] = {
+                title = row.header,
+                description = row.text or '',
+                disabled = row.disabled == true,
+                onSelect = (row.disabled == true) and nil or function()
+                    if row.params then
+                        TriggerEvent(row.params.event, row.params.args)
+                    end
+                end
+            }
+        end
+
+        OX.registerContext({ id = 'jg_crafting_menu', title = title, options = options })
+        OX.showContext('jg_crafting_menu')
+        return
+    end
+
+    -- qb-menu fallback: remove params for disabled so it can't be clicked
+    local fixed = {}
+    for i = 1, #menu do
+        local row = menu[i]
+        if row and row.disabled == true then
+            fixed[#fixed + 1] = { header = row.header, text = row.text or '', disabled = true }
+        else
+            fixed[#fixed + 1] = row
+        end
+    end
+
+    if HasRes('qb-menu') then
+        exports['qb-menu']:openMenu(fixed)
+    end
+end
+
+-- ======================
+-- CENTRAL CLEANUP
+-- ======================
+local function HardCleanup()
+    menuOpen = false
+    activeBenchType = nil
+    activeBenchId = nil
+    camBenchId = nil
+
+    RemovePreviewProp()
+    StopPreviewCam()
+    ShowLocalPlayer()
+
+    ForceCloseAnyMenu()
+end
+
+-- Failsafe cleanup:
+-- qb-menu uses NUI focus; ox_lib context does NOT reliably keep NUI focus.
+CreateThread(function()
+    while true do
+        Wait(200)
+
+        if (menuOpen or camActive) then
+            -- If pause menu is open, ALWAYS cleanup (ESC often leads here)
+            if IsPauseMenuActive() then
+                HardCleanup()
+                goto continue
+            end
+
+            if MenuSystem == 'ox' and OX then
+                local shouldCleanup = false
+
+                -- Best case: newer ox_lib
+                if OX.getOpenContext then
+                    local ok, ctx = pcall(OX.getOpenContext)
+                    if ok and ctx == nil then
+                        shouldCleanup = true
+                    end
+                else
+                    -- Fallback: if we can't query context state, use NUI focus loss
+                    -- (when ESC closes the context, focus usually drops)
+                    local nuiFocused = IsNuiFocused() or IsNuiFocusKeepingInput()
+                    if not nuiFocused then
+                        shouldCleanup = true
+                    end
+                end
+
+                if shouldCleanup then
+                    HardCleanup()
+                end
+            else
+                local nuiFocused = IsNuiFocused() or IsNuiFocusKeepingInput()
+                if not nuiFocused then
+                    HardCleanup()
+                end
+            end
+        end
+
+        ::continue::
+    end
+end)
+
+-- ======================
+-- INPUT (amount prompts)
+-- ======================
+local function InputAmount(cb)
+    if InputSystem == 'ox' and OX and OX.inputDialog then
+        local input = OX.inputDialog('How many?', {
+            { type = 'number', label = 'Amount', required = true, min = 1 }
+        })
+        if input and input[1] then cb(tonumber(input[1])) end
+        return
+    end
+
+    if HasRes('qb-input') then
+        local r = exports['qb-input']:ShowInput({
+            header = 'How many?',
+            submitText = 'Queue',
+            inputs = {
+                { text = 'Amount', name = 'amount', type = 'number', isRequired = true }
+            }
+        })
+        if r and r.amount then cb(tonumber(r.amount)) end
+    end
+end
+
+local function PromptDismantleAmount(item)
+    if not item or not item.name then return nil end
+
+    local removePer = tonumber(item.removeAmount) or 1
+    if removePer < 1 then removePer = 1 end
+
+    local have = GetLocalItemCount(item.name)
+    local maxQty = math.floor((tonumber(have) or 0) / removePer)
+
+    if maxQty < 1 then
+        QBCore.Functions.Notify(('You don’t have enough %s.'):format(item.label or item.name), 'error')
+        return nil
+    end
+
+    local title = ('Dismantle %s'):format(item.label or item.name)
+
+    if InputSystem == 'ox' and OX and OX.inputDialog then
+        local input = OX.inputDialog(title, {
+            { type = 'number', label = ('Amount (1-%s)'):format(maxQty), required = true, min = 1, max = maxQty }
+        })
+        if input and input[1] then
+            local amt = tonumber(input[1])
+            if amt and amt >= 1 and amt <= maxQty then
+                return amt
+            end
+        end
+        return nil
+    end
+
+    if HasRes('qb-input') then
+        local r = exports['qb-input']:ShowInput({
+            header = title,
+            submitText = 'Dismantle',
+            inputs = {
+                { text = ('Amount (1-%s)'):format(maxQty), name = 'amount', type = 'number', isRequired = true }
+            }
+        })
+
+        if r and r.amount then
+            local amt = tonumber(r.amount)
+            if amt and amt >= 1 and amt <= maxQty then
+                return amt
+            end
+            QBCore.Functions.Notify(('Invalid amount (1-%s).'):format(maxQty), 'error')
+        end
+        return nil
+    end
+
+    -- last resort
+    return 1
+end
+
+-- ======================
+-- ACCESS HELPERS
+-- ======================
+local function GetPlayerJobAndGrade()
+    local pData = QBCore.Functions.GetPlayerData() or {}
+    local job = pData.job or {}
+
+    local name = job.name
+    local grade = 0
+    if job.grade then
+        if type(job.grade) == 'table' then
+            grade = tonumber(job.grade.level) or tonumber(job.grade.grade) or 0
+        else
+            grade = tonumber(job.grade) or 0
+        end
+    end
+
+    return name, grade
+end
+
+local function GetPlayerGangAndGrade()
+    local pData = QBCore.Functions.GetPlayerData() or {}
+    local gang = pData.gang or {}
+
+    local name = gang.name
+    local grade = 0
+    if gang.grade then
+        if type(gang.grade) == 'table' then
+            grade = tonumber(gang.grade.level) or tonumber(gang.grade.grade) or 0
+        else
+            grade = tonumber(gang.grade) or 0
+        end
+    end
+
+    return name, grade
+end
+
+local function HasBenchAccess(benchRow)
+    if not benchRow then return false end
+
+    local hasJobRule  = benchRow.job and benchRow.job ~= ''
+    local hasGangRule = benchRow.gang and benchRow.gang ~= ''
+
+    -- Public bench
+    if not hasJobRule and not hasGangRule then
+        return true
+    end
+
+    local jobOk = false
+    if hasJobRule then
+        local myJob, myGrade = GetPlayerJobAndGrade()
+        local needJob = tostring(benchRow.job)
+        local needGrade = tonumber(benchRow.min_grade) or 0
+        jobOk = (myJob == needJob and myGrade >= needGrade)
+    end
+
+    local gangOk = false
+    if hasGangRule then
+        local myGang, myGangGrade = GetPlayerGangAndGrade()
+        local needGang = tostring(benchRow.gang)
+        local needGangGrade = tonumber(benchRow.gang_grade) or 0
+        gangOk = (myGang == needGang and myGangGrade >= needGangGrade)
+    end
+
+    -- either grants access
+    return jobOk or gangOk
+end
+
+-- ======================
+-- EMAIL
+-- ======================
+local function SendRequirementsEmail(item)
+    if not item then return end
+
+    local label = item.label or item.name or 'Item'
+    local lines = { ('Required items to craft %s:'):format(label) }
+
+    for reqItem, amount in pairs(item.requires or {}) do
+        lines[#lines + 1] = ('%sx %s'):format(amount, reqItem)
+    end
+
+    local msg = table.concat(lines, '\n')
+
+    if HasRes('qb-phone') then
+        TriggerEvent('qb-phone:client:sendNewMail', {
+            sender = 'Crafting Bench',
+            subject = ('Crafting Requirements: %s'):format(label),
+            message = msg,
+            button = {}
+        })
+        QBCore.Functions.Notify('Requirements sent to your phone', 'success')
+        return
+    end
+
+    if OX then
+        OX.notify({ title = 'Crafting Requirements', description = msg, type = 'inform' })
+    else
+        QBCore.Functions.Notify(msg, 'primary', 8000)
+    end
+end
+
+-- ======================
+-- BENCH PLACEMENT
+-- ======================
+local function BeginPlacement(benchType, onConfirm)
+    local bench = Config.BenchTypes and Config.BenchTypes[benchType]
+    if not bench or placing then return end
+
+    placing = true
+    placingHeading = GetEntityHeading(PlayerPedId())
+
+    if not LoadModel(bench.prop) then
+        placing = false
+        return
+    end
+
+    local pcoords = GetEntityCoords(PlayerPedId())
+    placingObj = CreateObject(joaat(bench.prop), pcoords.x, pcoords.y, pcoords.z, false, false, false)
+
+    SetEntityAlpha(placingObj, 180, false)
+    SetEntityCollision(placingObj, false, false)
+    FreezeEntityPosition(placingObj, true)
+
+    if OX and OX.showTextUI then
+        OX.showTextUI('[SCROLL] Rotate | [E] Confirm | [BACKSPACE] Cancel')
+    end
+
+    CreateThread(function()
+        while placing do
+            Wait(0)
+
+            local hit, endCoords = RaycastFromCamera(10.0)
+            if hit and placingObj and DoesEntityExist(placingObj) then
+                local z = endCoords.z + (bench.placeZOffset or 0.0)
+                SetEntityCoordsNoOffset(placingObj, endCoords.x, endCoords.y, z, false, false, false)
+                SetEntityHeading(placingObj, placingHeading)
+                SnapObjectToGround(placingObj)
+            end
+
+            if IsControlPressed(0, 15) then placingHeading = placingHeading + 1.5 end -- scroll up
+            if IsControlPressed(0, 14) then placingHeading = placingHeading - 1.5 end -- scroll down
+
+            if IsControlJustPressed(0, 38) then -- E
+                placing = false
+                if OX and OX.hideTextUI then OX.hideTextUI() end
+
+                if placingObj and DoesEntityExist(placingObj) then
+                    SnapObjectToGround(placingObj)
+
+                    local coords = GetEntityCoords(placingObj)
+                    local heading = GetEntityHeading(placingObj)
+
+                    DeleteEntity(placingObj)
+                    placingObj = nil
+
+                    if onConfirm then onConfirm(coords, heading) end
+                end
+                break
+            end
+
+            if IsControlJustPressed(0, 177) then -- Backspace
+                placing = false
+                if OX and OX.hideTextUI then OX.hideTextUI() end
+                if placingObj and DoesEntityExist(placingObj) then
+                    DeleteEntity(placingObj)
+                end
+                placingObj = nil
+                break
+            end
+        end
+    end)
+end
+
+local function StartBenchPlacement(benchType)
+    BeginPlacement(benchType, function(coords, heading)
+        -- you keep your existing PromptBenchAccess in your file; leaving it as-is
+        if not PromptBenchAccess then
+            QBCore.Functions.Notify('PromptBenchAccess missing (function not loaded)', 'error')
+            return
+        end
+
+        PromptBenchAccess(function(access)
+            if not access then
+                QBCore.Functions.Notify('Bench placement cancelled', 'error')
+                return
+            end
+
+            TriggerServerEvent('JG-Crafting:server:PlaceBench',
+                benchType,
+                coords,
+                heading,
+                access.job,
+                access.minGrade,
+                access.gang,
+                access.gangGrade
+            )
+        end)
+    end)
+end
+
+local function StartBenchPlacementForMove(benchId, benchType)
+    BeginPlacement(benchType, function(coords, heading)
+        TriggerServerEvent('JG-Crafting:server:UpdateBench', benchId, coords, heading)
+    end)
+end
+
+RegisterNetEvent('JG-Crafting:client:PlaceBench', function(benchType)
+    StartBenchPlacement(benchType)
+end)
+
+-- ======================
+-- ADMIN MENU (your existing admin options preserved)
+-- ======================
+local function CopyBenchInfo(benchRow)
+    local info = ('id=%s type=%s xyz=%.2f,%.2f,%.2f heading=%.2f'):format(
+        benchRow.id, benchRow.bench_type, benchRow.x, benchRow.y, benchRow.z, benchRow.heading
+    )
+
+    if OX and OX.setClipboard then
+        OX.setClipboard(info)
+        OX.notify({ title = 'Bench', description = 'Copied bench info to clipboard', type = 'success' })
+    else
+        QBCore.Functions.Notify(info, 'primary', 8000)
+    end
+end
+
+local function OpenAdminBenchMenu(benchRow)
+    if not isAdmin then
+        QBCore.Functions.Notify('Admins only', 'error')
+        return
+    end
+
+    local title = ('Manage Bench #%s (%s)'):format(benchRow.id, benchRow.bench_type)
+
+    if AdminMenuSystem == 'ox' and OX then
+        OX.registerContext({
+            id = 'jg_crafting_admin_bench',
+            title = title,
+            options = {
+                {
+                    title = 'Move / Reposition',
+                    description = 'Move this bench and save its position',
+                    onSelect = function()
+                        StartBenchPlacementForMove(benchRow.id, benchRow.bench_type)
+                    end
+                },
+                {
+                    title = 'Pick Up (return item)',
+                    description = 'Remove bench and return item (admin)',
+                    onSelect = function()
+                        TriggerServerEvent('JG-Crafting:server:PickupBench', benchRow.id)
+                    end
+                },
+                {
+                    title = 'Delete (no item)',
+                    description = 'Hard delete (no item returned)',
+                    onSelect = function()
+                        TriggerServerEvent('JG-Crafting:server:DeleteBench', benchRow.id)
+                    end
+                },
+                {
+                    title = 'Info (copy)',
+                    description = 'Copy id/type/coords/heading',
+                    onSelect = function()
+                        CopyBenchInfo(benchRow)
+                    end
+                }
+            }
+        })
+        OX.showContext('jg_crafting_admin_bench')
+        return
+    end
+
+    if HasRes('qb-menu') then
+        exports['qb-menu']:openMenu({
+            { header = title, isMenuHeader = true },
+            { header = 'Move / Reposition', text = 'Move this bench and save its position', params = { event = 'JG-Crafting:client:AdminMoveBench', args = benchRow } },
+            { header = 'Pick Up (return item)', text = 'Remove bench and return item (admin)', params = { event = 'JG-Crafting:client:AdminPickupBench', args = benchRow } },
+            { header = 'Delete (no item)', text = 'Hard delete (no item returned)', params = { event = 'JG-Crafting:client:AdminDeleteBench', args = benchRow } },
+            { header = 'Info (copy)', text = 'Copy id/type/coords/heading', params = { event = 'JG-Crafting:client:AdminInfoBench', args = benchRow } },
+            { header = 'Close', params = { event = 'JG-Crafting:client:CloseMenu' } }
+        })
+    end
+end
+
+RegisterNetEvent('JG-Crafting:client:AdminMoveBench', function(benchRow)
+    if not isAdmin then return end
+    StartBenchPlacementForMove(benchRow.id, benchRow.bench_type)
+end)
+
+RegisterNetEvent('JG-Crafting:client:AdminPickupBench', function(benchRow)
+    if not isAdmin then return end
+    TriggerServerEvent('JG-Crafting:server:PickupBench', benchRow.id)
+end)
+
+RegisterNetEvent('JG-Crafting:client:AdminDeleteBench', function(benchRow)
+    if not isAdmin then return end
+    TriggerServerEvent('JG-Crafting:server:DeleteBench', benchRow.id)
+end)
+
+RegisterNetEvent('JG-Crafting:client:AdminInfoBench', function(benchRow)
+    if not isAdmin then return end
+    CopyBenchInfo(benchRow)
+end)
+
+-- ======================
+-- MENUS (Craft + Dismantle)
+-- ======================
+function OpenCraftMenu(benchType, benchId)
+    local station = Config.BenchTypes and Config.BenchTypes[benchType]
+    if not station then return end
+
+    menuOpen = true
+    activeBenchType = benchType
+    activeBenchId = benchId
+
+    RemovePreviewProp()
+    StopPreviewCam()
+    HideLocalPlayer()
+
+    -- Start cam immediately when opening
+    local benchEntity = spawned[benchId]
+    if benchEntity and DoesEntityExist(benchEntity) then
+        if (not camActive) or camBenchId ~= benchId then
+            StartPreviewCam(benchEntity, benchEntity)
+            camBenchId = benchId
+        end
+    end
+
+    local menu = { { header = station.label, isMenuHeader = true } }
+
+    local isOxContext = (MenuSystem == 'ox' and OX)
+    local NL = isOxContext and '\n' or '<br>'
+
+    for _, item in pairs(station.items or {}) do
+        local lines = {}
+
+        for r, a in pairs(item.requires or {}) do
+            local have = GetLocalItemCount(r)
+            local need = tonumber(a) or 0
+
+            if have < need then
+                lines[#lines+1] = ('%sx %s (you have %s)'):format(need, r, have)
+            else
+                lines[#lines+1] = ('%sx %s'):format(need, r)
+            end
+        end
+
+        local canCraft = CanCraftItem(item)
+        local txt = table.concat(lines, NL)
+
+        if not canCraft then
+            txt = txt .. NL .. (isOxContext and 'Missing materials' or '<b>Missing materials</b>')
+        end
+
+        menu[#menu+1] = {
+            header = (canCraft and '' or '✖ ') .. (item.label or item.name),
+            text = txt,
+            disabled = not canCraft,
+            params = canCraft and {
+                event = 'JG-Crafting:client:SelectItem',
+                args = { benchType = benchType, benchId = benchId, item = item }
+            } or nil
+        }
+    end
+
+    menu[#menu + 1] = { header = 'Close', params = { event = 'JG-Crafting:client:CloseMenu' } }
+    OpenMenu(menu)
+end
+
+function OpenDismantleMenu(benchType, benchId)
+    local station = Config.BenchTypes and Config.BenchTypes[benchType]
+    if not station then return end
+
+    menuOpen = true
+    activeBenchType = benchType
+    activeBenchId = benchId
+
+    RemovePreviewProp()
+    StopPreviewCam()
+    HideLocalPlayer()
+
+    local benchEntity = spawned[benchId]
+    if benchEntity and DoesEntityExist(benchEntity) then
+        if (not camActive) or camBenchId ~= benchId then
+            StartPreviewCam(benchEntity, benchEntity)
+            camBenchId = benchId
+        end
+    end
+
+    local menu = { { header = station.label, isMenuHeader = true } }
+
+    local isOxContext = (MenuSystem == 'ox' and OX)
+    local NL = isOxContext and '\n' or '<br>'
+
+    for _, item in pairs(station.items or {}) do
+        local lines = {}
+
+        local removeAmt = tonumber(item.removeAmount) or 1
+        if removeAmt < 1 then removeAmt = 1 end
+
+        lines[#lines+1] = ('Consumes: %sx %s'):format(removeAmt, item.name)
+
+        -- NOTE: if you removed manual returns and auto-calc on server, this may show "None".
+        -- This is just UI text; server will still return correctly.
+        local mult = (Config.Dismantle and tonumber(Config.Dismantle.returnMultiplier)) or 1.0
+        local retLines = {}
+        for r, a in pairs(item.returns or {}) do
+            local amt = (tonumber(a) or 0) * mult
+            if not (Config.Dismantle and Config.Dismantle.roundDown == false) then
+                amt = math.floor(amt)
+            else
+                amt = math.floor(amt + 0.5)
+            end
+            if amt > 0 then
+                retLines[#retLines+1] = ('%sx %s'):format(amt, r)
+            end
+        end
+
+        lines[#lines+1] = 'Returns:'
+        lines[#lines+1] = (#retLines > 0 and table.concat(retLines, NL) or 'Auto (server)')
+
+        local canDo = CanDismantleItem(item)
+        local txt = table.concat(lines, NL)
+
+        if not canDo then
+            txt = txt .. NL .. (isOxContext and 'Missing item to dismantle' or '<b>Missing item to dismantle</b>')
+        end
+
+        menu[#menu+1] = {
+            header = (canDo and '' or '✖ ') .. (item.label or item.name),
+            text = txt,
+            disabled = not canDo,
+            params = canDo and {
+                event = 'JG-Crafting:client:SelectDismantleItem',
+                args = { benchType = benchType, benchId = benchId, item = item }
+            } or nil
+        }
+    end
+
+    menu[#menu + 1] = { header = 'Close', params = { event = 'JG-Crafting:client:CloseMenu' } }
+    OpenMenu(menu)
+end
+
+RegisterNetEvent('JG-Crafting:client:CloseMenu', function()
+    CloseMenuUI()
+    HardCleanup()
+end)
+
+RegisterNetEvent('JG-Crafting:client:SelectItem', function(data)
+    if not data or not data.item or not data.benchType then return end
+    local benchEntity = spawned[data.benchId]
+    if not benchEntity then return end
+
+    if data.item.preview then
+        SpawnPreviewPropOnBench(benchEntity, data.item.preview)
+    else
+        RemovePreviewProp()
+    end
+
+    OpenMenu({
+        { header = data.item.label or data.item.name, isMenuHeader = true },
+        { header = 'Craft', params = { event = 'JG-Crafting:client:InputCraft', args = data } },
+        { header = 'Send Email', params = { event = 'JG-Crafting:client:SendEmail', args = data.item } },
+        { header = 'Back', params = { event = 'JG-Crafting:client:Back', args = data.benchType } }
+    })
+end)
+
+RegisterNetEvent('JG-Crafting:client:SelectDismantleItem', function(data)
+    if not data or not data.item or not data.benchType then return end
+    local benchEntity = spawned[data.benchId]
+    if not benchEntity then return end
+
+    if data.item.preview then
+        SpawnPreviewPropOnBench(benchEntity, data.item.preview)
+    else
+        RemovePreviewProp()
+    end
+
+    OpenMenu({
+        { header = data.item.label or data.item.name, isMenuHeader = true },
+        { header = 'Dismantle', params = { event = 'JG-Crafting:client:DoDismantle', args = data } },
+        { header = 'Back', params = { event = 'JG-Crafting:client:BackDismantle', args = data.benchType } }
+    })
+end)
+
+RegisterNetEvent('JG-Crafting:client:BackDismantle', function(benchType)
+    RemovePreviewProp()
+    OpenDismantleMenu(benchType, activeBenchId)
+end)
+
+RegisterNetEvent('JG-Crafting:client:DoDismantle', function(data)
+    if not data or not data.item then return end
+
+    local item = data.item
+    local amount = PromptDismantleAmount(item)
+    if not amount or amount < 1 then
+        QBCore.Functions.Notify('Dismantling cancelled', 'error')
+        return
+    end
+
+    data.dismantleAmount = amount
+
+    local per = tonumber(item.time) or (Config.DefaultCraftTime or 3000)
+    local duration = per * amount
+    if duration > 120000 then duration = 120000 end
+
+    HideLocalPlayer()
+
+    local label = ('Dismantling %sx %s'):format(amount, (item.label or item.name))
+
+    local function onFinish()
+        ShowLocalPlayer()
+        TriggerServerEvent('JG-Crafting:server:DismantleItem', data)
+    end
+
+    local function onCancel()
+        ShowLocalPlayer()
+        QBCore.Functions.Notify('Dismantling cancelled', 'error')
+    end
+
+    if ProgressSystem == 'ox' and OX and OX.progressCircle then
+        local ok = OX.progressCircle({
+            duration = duration,
+            label = label,
+            disable = { move = true, combat = true },
+            canCancel = true,
+        })
+        if ok then onFinish() else onCancel() end
+        return
+    end
+
+    QBCore.Functions.Progressbar(
+        'jg_dismantle_' .. (item.name or 'item'),
+        label,
+        duration,
+        false,
+        true,
+        { disableMovement = true, disableCarMovement = true, disableMouse = false, disableCombat = true },
+        Config.Crafting,
+        {},
+        {},
+        onFinish,
+        onCancel
+    )
+end)
+
+RegisterNetEvent('JG-Crafting:client:SendEmail', function(item)
+    SendRequirementsEmail(item)
+end)
+
+RegisterNetEvent('JG-Crafting:client:Back', function(benchType)
+    RemovePreviewProp()
+    OpenCraftMenu(benchType, activeBenchId)
+end)
+
+-- ======================
+-- CRAFT QUEUE
+-- ======================
+RegisterNetEvent('JG-Crafting:client:InputCraft', function(data)
+    InputAmount(function(amount)
+        if amount and amount > 0 then
+            for _ = 1, amount do
+                craftingQueue[#craftingQueue + 1] = data
+            end
+            if not isCrafting then
+                TriggerEvent('JG-Crafting:client:ProcessCraftQueue')
+            end
+        end
+    end)
+end)
+
+RegisterNetEvent('JG-Crafting:client:ProcessCraftQueue', function()
+    if isCrafting or #craftingQueue == 0 then return end
+    isCrafting = true
+
+    local data = table.remove(craftingQueue, 1)
+    HideLocalPlayer()
+
+    local function finishSuccess()
+        ShowLocalPlayer()
+        TriggerServerEvent('JG-Crafting:server:CraftItem', data)
+        isCrafting = false
+        if #craftingQueue > 0 then
+            TriggerEvent('JG-Crafting:client:ProcessCraftQueue')
+        end
+    end
+
+    local function finishCancel()
+        ShowLocalPlayer()
+        QBCore.Functions.Notify('Crafting cancelled', 'error')
+        isCrafting = false
+        if #craftingQueue > 0 then
+            TriggerEvent('JG-Crafting:client:ProcessCraftQueue')
+        end
+    end
+
+    if ProgressSystem == 'ox' and OX and OX.progressCircle then
+        local success = OX.progressCircle({
+            duration = data.item.time or Config.DefaultCraftTime,
+            label = 'Crafting ' .. (data.item.label or data.item.name),
+            disable = { move = true, combat = true },
+            anim = GetCraftAnimForSystem(),
+            canCancel = true
+        })
+        if success then finishSuccess() else finishCancel() end
+        return
+    end
+
+    QBCore.Functions.Progressbar(
+        'craft_' .. (data.item.name or 'item'),
+        'Crafting ' .. (data.item.label or data.item.name),
+        data.item.time or Config.DefaultCraftTime,
+        false, true,
+        { disableMovement = true, disableCombat = true },
+        Config.Crafting, {}, {},
+        finishSuccess,
+        finishCancel
+    )
+end)
+
+RegisterNetEvent('JG-Crafting:client:RemoveCraftProp', function()
+    RemovePreviewProp()
+end)
+
+-- ======================
+-- BENCH SPAWNING / TARGETS
+-- ======================
+local function ClearBenches()
+    for _, obj in pairs(spawned) do
+        if DoesEntityExist(obj) then
+            DeleteEntity(obj)
+        end
+    end
+    spawned = {}
+end
+
+local function SpawnBenches()
+    ClearBenches()
+
+    for _, bench in pairs(benches) do
+        local def = Config.BenchTypes and Config.BenchTypes[bench.bench_type]
+        if def and LoadModel(def.prop) then
+            local obj = CreateObject(joaat(def.prop), bench.x, bench.y, bench.z, false, false, false)
+            SetEntityHeading(obj, bench.heading)
+
+            ResetEntityAlpha(obj)
+            SetEntityCollision(obj, true, true)
+
+            SnapObjectToGround(obj)
+            FreezeEntityPosition(obj, true)
+            spawned[bench.id] = obj
+
+            if TargetSystem == 'ox' and HasRes('ox_target') then
+                exports.ox_target:addLocalEntity(obj, {
+                    {
+                        label = (def.mode == 'dismantle') and 'Open Dismantler Bench' or 'Open Crafting Table',
+                        icon = (def.mode == 'dismantle') and 'recycle' or 'hammer',
+                        canInteract = function() return HasBenchAccess(bench) end,
+                        onSelect = function()
+                            if not HasBenchAccess(bench) then
+                                QBCore.Functions.Notify('You do not have access to use this bench', 'error')
+                                return
+                            end
+                            if def.mode == 'dismantle' then
+                                OpenDismantleMenu(bench.bench_type, bench.id)
+                            else
+                                OpenCraftMenu(bench.bench_type, bench.id)
+                            end
+                        end
+                    },
+                    {
+                        label = 'Admin: Manage Bench',
+                        icon = 'gear',
+                        canInteract = function() return isAdmin end,
+                        onSelect = function()
+                            OpenAdminBenchMenu(bench)
+                        end
+                    }
+                })
+            elseif HasRes('qb-target') then
+                exports['qb-target']:AddTargetEntity(obj, {
+                    options = {
+                        {
+                            label = (def.mode == 'dismantle') and 'Open Dismantler Bench' or 'Open Crafting Table',
+                            icon = (def.mode == 'dismantle') and 'fa-solid fa-recycle' or 'fa-solid fa-hammer',
+                            canInteract = function() return HasBenchAccess(bench) end,
+                            action = function()
+                                if not HasBenchAccess(bench) then
+                                    QBCore.Functions.Notify('You do not have access to use this bench', 'error')
+                                    return
+                                end
+                                if def.mode == 'dismantle' then
+                                    OpenDismantleMenu(bench.bench_type, bench.id)
+                                else
+                                    OpenCraftMenu(bench.bench_type, bench.id)
+                                end
+                            end
+                        },
+                        {
+                            label = 'Admin: Manage Bench',
+                            icon = 'fa-solid fa-gear',
+                            canInteract = function() return isAdmin end,
+                            action = function()
+                                OpenAdminBenchMenu(bench)
+                            end
+                        }
+                    },
+                    distance = 2.0
+                })
+            end
+        end
+    end
+end
+
+-- ======================
+-- LOAD FROM SERVER
+-- ======================
+local function RefreshBenches()
+    QBCore.Functions.TriggerCallback('qb-crafting:server:GetBenches', function(result)
+        benches = result or {}
+        SpawnBenches()
+    end)
+end
+
+RegisterNetEvent('JG-Crafting:client:RefreshBenches', RefreshBenches)
+
+CreateThread(function()
+    Wait(1500)
+    RefreshBenches()
+end)
+
+-- ======================
+-- CLEANUP
+-- ======================
+AddEventHandler('onResourceStop', function(res)
+    if res ~= GetCurrentResourceName() then return end
+    placing = false
+    ClearBenches()
+    if placingObj and DoesEntityExist(placingObj) then DeleteEntity(placingObj) end
+    placingObj = nil
+    HardCleanup()
+end)
