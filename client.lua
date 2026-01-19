@@ -75,6 +75,8 @@ local camActive = false
 local camBenchId = nil
 local lastCamInterp = 500
 
+local PromptBenchAccess
+
 -- local hide loop state
 local hiddenLoopRunning = false
 
@@ -627,35 +629,43 @@ local function GetPlayerGangAndGrade()
     return name, grade
 end
 
+-- STEP 4 (SAFE – GANG LOGIC PRESERVED)
 local function HasBenchAccess(benchRow)
     if not benchRow then return false end
 
-    local hasJobRule  = benchRow.job and benchRow.job ~= ''
-    local hasGangRule = benchRow.gang and benchRow.gang ~= ''
+    -- Inventory restriction (deny if player HAS item)
+    local rItem = benchRow.restrict_item
+    local rAmt  = tonumber(benchRow.restrict_amount) or 1
+    if rItem and rItem ~= '' and rAmt > 0 then
+        if GetLocalItemCount(rItem) >= rAmt then
+            return false
+        end
+    end
 
-    -- Public bench
-    if not hasJobRule and not hasGangRule then
+    -- Gang restriction
+    if benchRow.gang and benchRow.gang ~= '' then
+        local myGang, myGangGrade = GetPlayerGangAndGrade()
+        local needGrade = tonumber(benchRow.min_grade) or 0
+
+        if myGang ~= benchRow.gang then return false end
+        if myGangGrade < needGrade then return false end
+
         return true
     end
 
-    local jobOk = false
-    if hasJobRule then
-        local myJob, myGrade = GetPlayerJobAndGrade()
-        local needJob = tostring(benchRow.job)
+    -- Job restriction
+    if benchRow.job and benchRow.job ~= '' then
+        local myJob, myJobGrade = GetPlayerJobAndGrade()
         local needGrade = tonumber(benchRow.min_grade) or 0
-        jobOk = (myJob == needJob and myGrade >= needGrade)
+
+        if myJob ~= benchRow.job then return false end
+        if myJobGrade < needGrade then return false end
+
+        return true
     end
 
-    local gangOk = false
-    if hasGangRule then
-        local myGang, myGangGrade = GetPlayerGangAndGrade()
-        local needGang = tostring(benchRow.gang)
-        local needGangGrade = tonumber(benchRow.gang_grade) or 0
-        gangOk = (myGang == needGang and myGangGrade >= needGangGrade)
-    end
-
-    -- either grants access
-    return jobOk or gangOk
+    -- Public bench (no job/gang set)
+    return true
 end
 
 -- ======================
@@ -763,29 +773,419 @@ local function BeginPlacement(benchType, onConfirm)
     end)
 end
 
-local function StartBenchPlacement(benchType)
-    BeginPlacement(benchType, function(coords, heading)
-        -- you keep your existing PromptBenchAccess in your file; leaving it as-is
-        if not PromptBenchAccess then
-            QBCore.Functions.Notify('PromptBenchAccess missing (function not loaded)', 'error')
+-- ======================
+-- BENCH ACCESS PROMPT (Job/Gang/Public)
+-- ======================
+PromptBenchAccess = function(cb)
+    -- OX input
+    if InputSystem == 'ox' and OX and OX.inputDialog then
+        local input = OX.inputDialog('Bench Access', {
+            {
+                type = 'select',
+                label = 'Access Type',
+                options = {
+                    { label = 'Public', value = 'public' },
+                    { label = 'Job', value = 'job' },
+                    { label = 'Gang', value = 'gang' },
+                },
+                required = true
+            },
+            { type = 'input', label = 'Job/Gang Name (only if Job/Gang)', required = false },
+            { type = 'number', label = 'Minimum Grade (only if Job/Gang)', required = false, min = 0, default = 0 },
+        })
+
+        if not input then cb(nil) return end
+
+        local mode = input[1]
+        local name = (input[2] and tostring(input[2])) or ''
+        local grade = tonumber(input[3]) or 0
+
+        if mode == 'public' then
+            cb({ job = nil, gang = nil, minGrade = 0 })
             return
         end
 
+        if name == '' then cb(nil) return end
+
+        if mode == 'job' then
+            cb({ job = name, gang = nil, minGrade = grade })
+        else
+            cb({ job = nil, gang = name, minGrade = grade })
+        end
+        return
+    end
+
+    -- QB input
+    if HasRes('qb-input') then
+        local r = exports['qb-input']:ShowInput({
+            header = 'Bench Access',
+            submitText = 'Confirm',
+            inputs = {
+                { text = 'Access type (public/job/gang)', name = 'mode', type = 'text', isRequired = true },
+                { text = 'Job/Gang name (only if job/gang)', name = 'name', type = 'text', isRequired = false },
+                { text = 'Minimum grade (only if job/gang)', name = 'grade', type = 'number', isRequired = false }
+            }
+        })
+
+        if not r then cb(nil) return end
+
+        local mode = tostring(r.mode or ''):lower()
+        local name = (r.name and tostring(r.name)) or ''
+        local grade = tonumber(r.grade) or 0
+
+        if mode == 'public' then
+            cb({ job = nil, gang = nil, minGrade = 0 })
+            return
+        end
+
+        if (mode ~= 'job' and mode ~= 'gang') or name == '' then
+            cb(nil)
+            return
+        end
+
+        if mode == 'job' then
+            cb({ job = name, gang = nil, minGrade = grade })
+        else
+            cb({ job = nil, gang = name, minGrade = grade })
+        end
+        return
+    end
+
+    -- no input system available
+    cb(nil)
+end
+
+-- ======================
+-- BENCH RESTRICTION PROMPT (deny if player HAS item)
+-- ======================
+local function PromptBenchRestriction(cb)
+    -- OX input
+    if InputSystem == 'ox' and HAS_OX_LIB then
+        local input = lib.inputDialog('Bench Restriction (Optional)', {
+            {
+                type = 'input',
+                label = 'Restricted Item Name',
+                description = 'If a player HAS this item, they cannot use the bench. Leave blank for none.',
+                required = false
+            },
+            {
+                type = 'number',
+                label = 'Restricted Amount',
+                description = 'Minimum amount to block access (default 1)',
+                required = false,
+                min = 1,
+                default = 1
+            }
+        })
+
+        if not input then
+            cb(nil) -- cancelled dialog entirely
+            return
+        end
+
+        local item = (input[1] and tostring(input[1])) or ''
+        local amount = tonumber(input[2]) or 1
+
+        if item == '' then
+            cb({ item = nil, amount = 1 })
+        else
+            cb({ item = item, amount = math.max(1, amount) })
+        end
+        return
+    end
+
+    -- QB input
+    local r = exports['qb-input']:ShowInput({
+        header = 'Bench Restriction (Optional)',
+        submitText = 'Confirm',
+        inputs = {
+            {
+                text = 'Restricted item name (leave blank = none)',
+                name = 'restrictItem',
+                type = 'text',
+                isRequired = false
+            },
+            {
+                text = 'Restricted amount (default 1)',
+                name = 'restrictAmount',
+                type = 'number',
+                isRequired = false
+            }
+        }
+    })
+
+    if not r then
+        cb(nil) -- cancelled
+        return
+    end
+
+    local item = (r.restrictItem and tostring(r.restrictItem)) or ''
+    local amount = tonumber(r.restrictAmount) or 1
+
+    if item == '' then
+        cb({ item = nil, amount = 1 })
+    else
+        cb({ item = item, amount = math.max(1, amount) })
+    end
+end
+
+-- ======================
+-- BENCH ACCESS PROMPT (Job/Gang/Public) with job/gang dropdowns
+-- ======================
+local function BuildJobOptions()
+    local opts = {}
+    local jobs = (QBCore.Shared and QBCore.Shared.Jobs) or {}
+    for name, data in pairs(jobs) do
+        local label = (data and data.label) or name
+        opts[#opts + 1] = { label = label .. ' (' .. name .. ')', value = name }
+    end
+    table.sort(opts, function(a,b) return a.label < b.label end)
+    return opts
+end
+
+local function BuildGangOptions()
+    local opts = {}
+    local gangs = (QBCore.Shared and (QBCore.Shared.Gangs or QBCore.Shared.Gang)) or {}
+    if type(gangs) == 'table' then
+        for name, data in pairs(gangs) do
+            local label = (data and data.label) or name
+            opts[#opts + 1] = { label = label .. ' (' .. name .. ')', value = name }
+        end
+    end
+    table.sort(opts, function(a,b) return a.label < b.label end)
+    return opts
+end
+
+-- ======================
+-- BENCH ACCESS PROMPT (Job/Gang/Public) with job/gang dropdowns
+-- ======================
+local function BuildJobOptions()
+    local opts = {}
+    local jobs = (QBCore.Shared and QBCore.Shared.Jobs) or {}
+    for name, data in pairs(jobs) do
+        local label = (data and data.label) or name
+        opts[#opts + 1] = { label = label .. ' (' .. name .. ')', value = name }
+    end
+    table.sort(opts, function(a,b) return a.label < b.label end)
+    return opts
+end
+
+local function BuildGangOptions()
+    local opts = {}
+    local gangs = (QBCore.Shared and (QBCore.Shared.Gangs or QBCore.Shared.Gang)) or {}
+    if type(gangs) == 'table' then
+        for name, data in pairs(gangs) do
+            local label = (data and data.label) or name
+            opts[#opts + 1] = { label = label .. ' (' .. name .. ')', value = name }
+        end
+    end
+    table.sort(opts, function(a,b) return a.label < b.label end)
+    return opts
+end
+
+PromptBenchAccess = function(cb)
+    -- ---------- OX (ox_lib) ----------
+    if InputSystem == 'ox' and OX and OX.inputDialog then
+        local step1 = OX.inputDialog('Bench Access', {
+            {
+                type = 'select',
+                label = 'Access Type',
+                options = {
+                    { label = 'Public', value = 'public' },
+                    { label = 'Job', value = 'job' },
+                    { label = 'Gang', value = 'gang' },
+                },
+                required = true
+            }
+        })
+
+        if not step1 then cb(nil) return end
+        local mode = step1[1]
+
+        if mode == 'public' then
+            cb({ job = nil, gang = nil, minGrade = 0 })
+            return
+        end
+
+        if mode == 'job' then
+            local jobOpts = BuildJobOptions()
+            if #jobOpts == 0 then cb(nil) return end
+
+            local step2 = OX.inputDialog('Job Restriction', {
+                { type = 'select', label = 'Job', options = jobOpts, required = true },
+                { type = 'number', label = 'Minimum Grade', required = false, min = 0, default = 0 },
+            })
+
+            if not step2 then cb(nil) return end
+            cb({ job = step2[1], gang = nil, minGrade = tonumber(step2[2]) or 0 })
+            return
+        end
+
+        if mode == 'gang' then
+            local gangOpts = BuildGangOptions()
+            if #gangOpts == 0 then
+                -- If your server doesn’t expose gangs in QBCore.Shared, you can swap this to your own list.
+                QBCore.Functions.Notify('No gang list found in QBCore.Shared.Gangs', 'error')
+                cb(nil)
+                return
+            end
+
+            local step2 = OX.inputDialog('Gang Restriction', {
+                { type = 'select', label = 'Gang', options = gangOpts, required = true },
+                { type = 'number', label = 'Minimum Grade', required = false, min = 0, default = 0 },
+            })
+
+            if not step2 then cb(nil) return end
+            cb({ job = nil, gang = step2[1], minGrade = tonumber(step2[2]) or 0 })
+            return
+        end
+
+        cb(nil)
+        return
+    end
+
+    -- ---------- QB fallback (qb-menu if available) ----------
+    if HasRes('qb-menu') then
+        exports['qb-menu']:openMenu({
+            { header = 'Bench Access', isMenuHeader = true },
+
+            {
+                header = 'Public',
+                text = 'Anyone can use this bench',
+                params = { event = 'JG-Crafting:client:_benchAccessResult', args = { job=nil, gang=nil, minGrade=0 } }
+            },
+            {
+                header = 'Job Restriction',
+                text = 'Pick a job from the list',
+                params = { event = 'JG-Crafting:client:_benchAccessPickJob', args = {} }
+            },
+            {
+                header = 'Gang Restriction',
+                text = 'Pick a gang from the list',
+                params = { event = 'JG-Crafting:client:_benchAccessPickGang', args = {} }
+            },
+            { header = 'Cancel', params = { event = 'JG-Crafting:client:_benchAccessCancel' } }
+        })
+
+        -- one-shot temporary handlers
+        local function cleanupHandlers()
+            RemoveEventHandler(_G.__JG_BENCH_ACCESS_RES or 0)
+            RemoveEventHandler(_G.__JG_BENCH_ACCESS_CANCEL or 0)
+            RemoveEventHandler(_G.__JG_BENCH_ACCESS_PICKJOB or 0)
+            RemoveEventHandler(_G.__JG_BENCH_ACCESS_PICKGANG or 0)
+            _G.__JG_BENCH_ACCESS_RES = nil
+            _G.__JG_BENCH_ACCESS_CANCEL = nil
+            _G.__JG_BENCH_ACCESS_PICKJOB = nil
+            _G.__JG_BENCH_ACCESS_PICKGANG = nil
+        end
+
+        _G.__JG_BENCH_ACCESS_RES = AddEventHandler('JG-Crafting:client:_benchAccessResult', function(data)
+            cleanupHandlers()
+            cb(data)
+        end)
+
+        _G.__JG_BENCH_ACCESS_CANCEL = AddEventHandler('JG-Crafting:client:_benchAccessCancel', function()
+            cleanupHandlers()
+            cb(nil)
+        end)
+
+        _G.__JG_BENCH_ACCESS_PICKJOB = AddEventHandler('JG-Crafting:client:_benchAccessPickJob', function()
+            local jobOpts = BuildJobOptions()
+            if #jobOpts == 0 then
+                QBCore.Functions.Notify('No jobs found.', 'error')
+                cleanupHandlers()
+                cb(nil)
+                return
+            end
+
+            local menu = { { header = 'Select Job', isMenuHeader = true } }
+            for _, o in ipairs(jobOpts) do
+                menu[#menu+1] = {
+                    header = o.label,
+                    params = { event = 'JG-Crafting:client:_benchAccessAskGradeJob', args = { job = o.value } }
+                }
+            end
+            menu[#menu+1] = { header = 'Back', params = { event = 'JG-Crafting:client:_benchAccessCancel' } }
+            exports['qb-menu']:openMenu(menu)
+        end)
+
+        _G.__JG_BENCH_ACCESS_PICKGANG = AddEventHandler('JG-Crafting:client:_benchAccessPickGang', function()
+            local gangOpts = BuildGangOptions()
+            if #gangOpts == 0 then
+                QBCore.Functions.Notify('No gangs found in QBCore.Shared.Gangs.', 'error')
+                cleanupHandlers()
+                cb(nil)
+                return
+            end
+
+            local menu = { { header = 'Select Gang', isMenuHeader = true } }
+            for _, o in ipairs(gangOpts) do
+                menu[#menu+1] = {
+                    header = o.label,
+                    params = { event = 'JG-Crafting:client:_benchAccessAskGradeGang', args = { gang = o.value } }
+                }
+            end
+            menu[#menu+1] = { header = 'Back', params = { event = 'JG-Crafting:client:_benchAccessCancel' } }
+            exports['qb-menu']:openMenu(menu)
+        end)
+
+        -- grade prompts (qb-input)
+        RegisterNetEvent('JG-Crafting:client:_benchAccessAskGradeJob', function(args)
+            local r = HasRes('qb-input') and exports['qb-input']:ShowInput({
+                header = 'Minimum Job Grade',
+                submitText = 'Confirm',
+                inputs = { { text = 'Min grade (0 = any)', name = 'grade', type = 'number', isRequired = false } }
+            }) or nil
+
+            local grade = (r and tonumber(r.grade)) or 0
+            TriggerEvent('JG-Crafting:client:_benchAccessResult', { job = args.job, gang = nil, minGrade = grade })
+        end)
+
+        RegisterNetEvent('JG-Crafting:client:_benchAccessAskGradeGang', function(args)
+            local r = HasRes('qb-input') and exports['qb-input']:ShowInput({
+                header = 'Minimum Gang Grade',
+                submitText = 'Confirm',
+                inputs = { { text = 'Min grade (0 = any)', name = 'grade', type = 'number', isRequired = false } }
+            }) or nil
+
+            local grade = (r and tonumber(r.grade)) or 0
+            TriggerEvent('JG-Crafting:client:_benchAccessResult', { job = nil, gang = args.gang, minGrade = grade })
+        end)
+
+        return
+    end
+
+    -- No UI available
+    cb(nil)
+end
+
+-- ======================
+-- BENCH PLACEMENT FLOW
+-- ======================
+local function StartBenchPlacement(benchType)
+    BeginPlacement(benchType, function(coords, heading)
         PromptBenchAccess(function(access)
             if not access then
                 QBCore.Functions.Notify('Bench placement cancelled', 'error')
                 return
             end
 
-            TriggerServerEvent('JG-Crafting:server:PlaceBench',
-                benchType,
-                coords,
-                heading,
-                access.job,
-                access.minGrade,
-                access.gang,
-                access.gangGrade
-            )
+            PromptBenchRestriction(function(restrict)
+                if restrict == nil then
+                    QBCore.Functions.Notify('Bench placement cancelled', 'error')
+                    return
+                end
+
+                TriggerServerEvent('JG-Crafting:server:PlaceBench',
+                    benchType,
+                    coords,
+                    heading,
+                    access.job,
+                    access.minGrade,
+                    restrict.item,
+                    restrict.amount
+                )
+            end)
         end)
     end)
 end
@@ -1251,7 +1651,11 @@ local function SpawnBenches()
                         canInteract = function() return HasBenchAccess(bench) end,
                         onSelect = function()
                             if not HasBenchAccess(bench) then
-                                QBCore.Functions.Notify('You do not have access to use this bench', 'error')
+                                if bench.restrict_item and bench.restrict_item ~= '' then
+                                    QBCore.Functions.Notify(('You cannot use this bench while carrying: %s'):format(bench.restrict_item), 'error')
+                                else
+                                    QBCore.Functions.Notify('You do not have access to use this bench', 'error')
+                                end
                                 return
                             end
                             if def.mode == 'dismantle' then
@@ -1279,7 +1683,11 @@ local function SpawnBenches()
                             canInteract = function() return HasBenchAccess(bench) end,
                             action = function()
                                 if not HasBenchAccess(bench) then
-                                    QBCore.Functions.Notify('You do not have access to use this bench', 'error')
+                                    if bench.restrict_item and bench.restrict_item ~= '' then
+                                        QBCore.Functions.Notify(('You cannot use this bench while carrying: %s'):format(bench.restrict_item), 'error')
+                                    else
+                                        QBCore.Functions.Notify('You do not have access to use this bench', 'error')
+                                    end
                                     return
                                 end
                                 if def.mode == 'dismantle' then

@@ -9,5 +9,7 @@ CREATE TABLE IF NOT EXISTS crafting_benches (
     job VARCHAR(50),
     min_grade INT DEFAULT 0,
     gang VARCHAR(50) NULL,
-    gang_grade INT NOT NULL DEFAULT 0;
+    gang_grade INT NOT NULL DEFAULT 0,
+    restrict_item VARCHAR(50) NULL,
+    restrict_amount INT NOT NULL DEFAULT 1;
 );
