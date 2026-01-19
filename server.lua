@@ -1,4 +1,4 @@
--- JG-Crafting/server.lua (cleaned + safer)
+-- JG-Crafting/server.lua (cleaned + safer + auto usable benches)
 local QBCore = exports['qb-core']:GetCoreObject()
 
 -- ======================
@@ -55,7 +55,7 @@ local function PlayerFields(src, Player)
     }
 end
 
-local function BenchFields(benchType, id, coords, heading, job, minGrade, gang, gangGrade)
+local function BenchFields(benchType, id, coords, heading, job, minGrade, gang, gangGrade, restrictItem, restrictAmount)
     local c = coords or {}
     local xyz = ("x=%.2f, y=%.2f, z=%.2f"):format(tonumber(c.x) or 0.0, tonumber(c.y) or 0.0, tonumber(c.z) or 0.0)
     return {
@@ -64,7 +64,8 @@ local function BenchFields(benchType, id, coords, heading, job, minGrade, gang, 
         { name = "Coords", value = xyz, inline = false },
         { name = "Heading", value = Safe(heading), inline = true },
         { name = "Access (Job)", value = ("%s | min grade: %s"):format(Safe(job), Safe(minGrade)), inline = false },
-        { name = "Access (Gang)", value = ("%s | min grade: %s"):format(Safe(gang), Safe(gangGrade)), inline = false }
+        { name = "Access (Gang)", value = ("%s | min grade: %s"):format(Safe(gang), Safe(gangGrade)), inline = false },
+        { name = "Item Restriction", value = ("%s x%s"):format(Safe(restrictItem), Safe(restrictAmount)), inline = false }
     }
 end
 
@@ -77,8 +78,6 @@ local function UsingOxInventory()
 
     if pref == 'ox' then return true end
     if pref == 'qb' then return false end
-
-    -- auto
     return HasRes('ox_inventory')
 end
 
@@ -112,8 +111,6 @@ local function GetItemCount(src, Player, item)
 end
 
 local function NormalizeOxSuccess(ret)
-    -- ox_inventory return values vary by version:
-    -- sometimes boolean, sometimes number (count removed/added), sometimes table
     if type(ret) == 'boolean' then return ret end
     if type(ret) == 'number' then return ret > 0 end
     if type(ret) == 'table' then return true end
@@ -166,13 +163,11 @@ end
 -- ADMIN CHECK
 -- ======================
 local function IsAdmin(src)
-    -- QB-Core perms
     if QBCore.Functions.HasPermission
         and (QBCore.Functions.HasPermission(src, 'admin') or QBCore.Functions.HasPermission(src, 'god')) then
         return true
     end
 
-    -- Qbox group system
     if HasRes('qbx_core') then
         local ok, group = pcall(function()
             return exports.qbx_core:GetGroup(src)
@@ -191,26 +186,48 @@ RegisterNetEvent('JG-Crafting:server:CheckAdmin', function()
 end)
 
 -- ======================
--- USABLE BENCH ITEMS (ADMIN)
+-- USABLE BENCH ITEMS (AUTO FROM CONFIG)
 -- ======================
-local function EnsureUseableItem(name, benchType)
-    QBCore.Functions.CreateUseableItem(name, function(source)
-        if not IsAdmin(source) then
-            TriggerClientEvent('QBCore:Notify', source, 'Only admins can place benches', 'error')
-            return
-        end
-        TriggerClientEvent('JG-Crafting:client:PlaceBench', source, benchType)
-    end)
+local function GetBenchItemName(benchDef)
+    if benchDef and benchDef.item and benchDef.item ~= '' then
+        return benchDef.item
+    end
+    if benchDef and benchDef.placeItem and benchDef.placeItem ~= '' then
+        return benchDef.placeItem
+    end
+    return nil
 end
 
-EnsureUseableItem('crafting_bench', 'weaponbench')
-EnsureUseableItem('mechanic_bench', 'mechanicbench')
-EnsureUseableItem('dismantler_bench', 'dismantlerbench')
+local function RegisterBenchUsables()
+    if not Config.BenchTypes then return end
+
+    local registered = {}
+    for benchType, benchDef in pairs(Config.BenchTypes) do
+        local itemName = GetBenchItemName(benchDef)
+
+        if itemName and not registered[itemName] then
+            registered[itemName] = true
+
+            QBCore.Functions.CreateUseableItem(itemName, function(src)
+                if not IsAdmin(src) then
+                    TriggerClientEvent('QBCore:Notify', src, 'Only admins can place benches', 'error')
+                    return
+                end
+                TriggerClientEvent('JG-Crafting:client:PlaceBench', src, benchType)
+            end)
+        end
+    end
+end
+
+CreateThread(function()
+    Wait(0)
+    RegisterBenchUsables()
+end)
 
 -- ======================
 -- LOAD BENCHES
 -- ======================
-QBCore.Functions.CreateCallback('qb-crafting:server:GetBenches', function(_, cb)
+QBCore.Functions.CreateCallback('JG-Crafting:server:GetBenches', function(_, cb)
     local rows = exports.oxmysql:querySync('SELECT * FROM crafting_benches') or {}
     cb(rows)
 end)
@@ -233,7 +250,6 @@ RegisterNetEvent('JG-Crafting:server:UpdateBench', function(id, coords, heading)
         { coords.x, coords.y, coords.z, heading or 0.0, id }
     )
 
-    -- webhook: moved
     do
         local fields = {}
         for _, f in ipairs(PlayerFields(src, Player)) do fields[#fields+1] = f end
@@ -247,6 +263,7 @@ RegisterNetEvent('JG-Crafting:server:UpdateBench', function(id, coords, heading)
             fields[#fields+1] = { name = "New Heading", value = Safe(heading), inline = true }
             fields[#fields+1] = { name = "Access (Job)", value = ("%s | min grade: %s"):format(Safe(old.job), Safe(old.min_grade)), inline = false }
             fields[#fields+1] = { name = "Access (Gang)", value = ("%s | min grade: %s"):format(Safe(old.gang), Safe(old.gang_grade)), inline = false }
+            fields[#fields+1] = { name = "Item Restriction", value = ("%s x%s"):format(Safe(old.restrict_item), Safe(old.restrict_amount)), inline = false }
         else
             fields[#fields+1] = { name = "Bench ID", value = Safe(id), inline = true }
             fields[#fields+1] = { name = "New Coords", value = ("x=%.2f, y=%.2f, z=%.2f"):format(coords.x, coords.y, coords.z), inline = false }
@@ -276,7 +293,7 @@ RegisterNetEvent('JG-Crafting:server:DeleteBench', function(id)
 
         if bench then
             local coords = { x = bench.x, y = bench.y, z = bench.z }
-            for _, f in ipairs(BenchFields(bench.bench_type, bench.id, coords, bench.heading, bench.job, bench.min_grade, bench.gang, bench.gang_grade)) do
+            for _, f in ipairs(BenchFields(bench.bench_type, bench.id, coords, bench.heading, bench.job, bench.min_grade, bench.gang, bench.gang_grade, bench.restrict_item, bench.restrict_amount)) do
                 fields[#fields+1] = f
             end
         else
@@ -290,7 +307,8 @@ RegisterNetEvent('JG-Crafting:server:DeleteBench', function(id)
     TriggerClientEvent('JG-Crafting:client:RefreshBenches', -1)
 end)
 
-RegisterNetEvent('JG-Crafting:server:PlaceBench', function(benchType, coords, heading, job, minGrade, gang, gangGrade)
+-- NOTE: signature includes gang + gangGrade + restrictItem + restrictAmount
+RegisterNetEvent('JG-Crafting:server:PlaceBench', function(benchType, coords, heading, job, minGrade, gang, gangGrade, restrictItem, restrictAmount)
     local src = source
     if not IsAdmin(src) then
         TriggerClientEvent('QBCore:Notify', src, 'Only admins can place benches', 'error')
@@ -307,8 +325,9 @@ RegisterNetEvent('JG-Crafting:server:PlaceBench', function(benchType, coords, he
         return
     end
 
-    local itemName = benchDef.placeItem
-    if not itemName or itemName == '' then itemName = 'crafting_bench' end
+    -- prefer benchDef.item, fallback to placeItem, then crafting_bench
+    local itemName = (benchDef.item or benchDef.placeItem or 'crafting_bench')
+    if itemName == '' then itemName = 'crafting_bench' end
 
     local have = GetItemCount(src, Player, itemName)
     if have < 1 then
@@ -324,29 +343,38 @@ RegisterNetEvent('JG-Crafting:server:PlaceBench', function(benchType, coords, he
     -- sanitize
     if job == '' then job = nil end
     if gang == '' then gang = nil end
+
     minGrade = tonumber(minGrade) or 0
     gangGrade = tonumber(gangGrade) or 0
     if minGrade < 0 then minGrade = 0 end
     if gangGrade < 0 then gangGrade = 0 end
 
+    if restrictItem == '' then restrictItem = nil end
+    restrictAmount = tonumber(restrictAmount) or 1
+    if restrictAmount < 1 then restrictAmount = 1 end
+
+    -- IMPORTANT: ensure your SQL table has these columns:
+    -- restrict_item, restrict_amount
     local newId = exports.oxmysql:insertSync(
-        'INSERT INTO crafting_benches (bench_type, x, y, z, heading, owner, job, min_grade, gang, gang_grade) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO crafting_benches (bench_type, x, y, z, heading, owner, job, min_grade, gang, gang_grade, restrict_item, restrict_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         {
             benchType,
             coords.x, coords.y, coords.z,
             heading or 0.0,
             Player.PlayerData.citizenid,
-            job,
-            minGrade,
-            gang,
-            gangGrade
+            job, minGrade,
+            gang, gangGrade,
+            restrictItem, restrictAmount
         }
     )
 
     do
         local fields = {}
         for _, f in ipairs(PlayerFields(src, Player)) do fields[#fields+1] = f end
-        for _, f in ipairs(BenchFields(benchType, newId, coords, heading, job, minGrade, gang, gangGrade)) do fields[#fields+1] = f end
+        for _, f in ipairs(BenchFields(benchType, newId, coords, heading, job, minGrade, gang, gangGrade, restrictItem, restrictAmount)) do
+            fields[#fields+1] = f
+        end
+        fields[#fields+1] = { name = "Bench Item", value = Safe(itemName), inline = true }
         SendDiscordWebhook("placed", "Bench Placed", fields)
     end
 
@@ -369,7 +397,9 @@ RegisterNetEvent('JG-Crafting:server:PickupBench', function(id)
     exports.oxmysql:execute('DELETE FROM crafting_benches WHERE id = ?', { id })
 
     local benchDef = Config.BenchTypes and Config.BenchTypes[bench.bench_type]
-    local itemName = (benchDef and benchDef.placeItem) or 'crafting_bench'
+    local itemName = (benchDef and (benchDef.item or benchDef.placeItem)) or 'crafting_bench'
+    if itemName == '' then itemName = 'crafting_bench' end
+
     AddItem(src, Player, itemName, 1)
 
     do
@@ -377,7 +407,7 @@ RegisterNetEvent('JG-Crafting:server:PickupBench', function(id)
         for _, f in ipairs(PlayerFields(src, Player)) do fields[#fields+1] = f end
 
         local coords = { x = bench.x, y = bench.y, z = bench.z }
-        for _, f in ipairs(BenchFields(bench.bench_type, bench.id, coords, bench.heading, bench.job, bench.min_grade, bench.gang, bench.gang_grade)) do
+        for _, f in ipairs(BenchFields(bench.bench_type, bench.id, coords, bench.heading, bench.job, bench.min_grade, bench.gang, bench.gang_grade, bench.restrict_item, bench.restrict_amount)) do
             fields[#fields+1] = f
         end
 
@@ -401,7 +431,6 @@ RegisterNetEvent('JG-Crafting:server:CraftItem', function(data)
     local item = data.item
     local requires = item.requires or {}
 
-    -- validate requirements
     for reqItem, amount in pairs(requires) do
         local need = tonumber(amount) or 0
         if need > 0 then
@@ -416,7 +445,6 @@ RegisterNetEvent('JG-Crafting:server:CraftItem', function(data)
         end
     end
 
-    -- remove requirements
     for reqItem, amount in pairs(requires) do
         local need = tonumber(amount) or 0
         if need > 0 and not RemoveItem(src, Player, reqItem, need) then
@@ -428,7 +456,6 @@ RegisterNetEvent('JG-Crafting:server:CraftItem', function(data)
         end
     end
 
-    -- give crafted item
     local giveAmount = tonumber(item.amount) or 1
     AddItem(src, Player, item.name, giveAmount)
 
@@ -469,9 +496,7 @@ RegisterNetEvent('JG-Crafting:server:DismantleItem', function(data)
     local itemName = data.item and data.item.name
     if not itemName then return end
 
-    -- find item definition inside dismantler config
-    local itemDef
- = nil
+    local itemDef = nil
     for _, it in pairs(benchDef.items or {}) do
         if it and it.name == itemName then
             itemDef = it
@@ -512,14 +537,13 @@ RegisterNetEvent('JG-Crafting:server:DismantleItem', function(data)
 
     local baseReturns = itemDef.returns
 
-    -- Auto-calc returns from craft recipe if returns missing
     if baseReturns == nil then
         local requires, craftOut = FindCraftRecipe(itemName)
         if requires then
             baseReturns = {}
             for reqItem, reqAmt in pairs(requires) do
                 local perOne = (tonumber(reqAmt) or 0) / craftOut
-                baseReturns[reqItem] = perOne -- per 1 dismantle
+                baseReturns[reqItem] = perOne
             end
         else
             baseReturns = {}

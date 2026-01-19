@@ -1,4 +1,4 @@
-# qb-crafting – Placeable Crafting Benches
+# JG-Crafting – Placeable Crafting Benches
 
 A **QBCore And Qbox crafting system** that supports **placeable crafting benches as items**, with **ox_lib placement**, **database persistence**, and **job / grade restricted pickup**.
 
@@ -47,7 +47,7 @@ This resource is designed to work with **QBCore**, **Qbox**, **ox_lib**, and eit
 ensure ox_lib
 ensure oxmysql
 ensure qb-core
-ensure qb-crafting
+ensure JG-Crafting
 ```
 
 ---
