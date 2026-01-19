@@ -98,7 +98,7 @@ Config.PreviewCam = {
 -- ======================
 Config.BenchTypes = {
     weaponbench = {
-        item         = "weapon_bench",      
+        item         = "crafting_bench",    
         label        = "Weapon Crafting Bench",
         prop         = "gr_prop_gr_bench_04a",
         mode         = "craft", -- (optional) default behavior
@@ -151,7 +151,7 @@ Config.BenchTypes = {
     },
 
     mechanicbench = {
-        item         = "mechanic_bench",
+        item      = "mechanic_bench",
         label     = "Mechanic Crafting Bench",
         prop      = "prop_tool_bench02",
         mode      = "craft",

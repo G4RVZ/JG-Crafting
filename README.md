@@ -84,15 +84,41 @@ Add the crafting bench item to **qb-core/shared/items.lua**:
     image = 'crafting_bench.png',
     unique = false,
     useable = true,
+},
+['mechanic_bench'] = {
+    name = 'mechanic_bench',
+    label = 'Mechanic Bench',
+    weight = 5000,
+    type = 'item',
+    image = 'mechanic_bench.png',
+    unique = false,
+    useable = true,
+},
+['dismantler_bench'] = {
+    name = 'dismantler_bench',
+    label = 'Dismantler Bench',
+    weight = 5000,
+    type = 'item',
+    image = 'dismantler_bench.png',
+    unique = false,
+    useable = true,
 }
 ```
-
-Make sure the item is **usable** and triggers the client event:
+Add the crafting bench item to **ox-inventory/data/items.lua**:
 
 ```lua
-QBCore.Functions.CreateUseableItem('crafting_bench', function(source)
-    TriggerClientEvent('JG-Crafting:client:PlaceBench', source, 'weaponbench')
-end)
+    ['crafting_bench'] = {
+        label = 'Crafting Bench',
+        weight = 200,
+    },
+    ['mechanic_bench'] = {
+        label = 'Mechanic Bench',
+        weight = 200,
+    },
+    ['dismantler_bench'] = {
+        label = 'Dismantler Bench',
+        weight = 200,
+    },
 ```
 
 ---

@@ -79,6 +79,8 @@ local PromptBenchAccess
 
 -- local hide loop state
 local hiddenLoopRunning = false
+local allowVisibleWhileMenu = false
+
 
 -- ======================
 -- ADMIN STATE
@@ -192,6 +194,54 @@ local function GetCraftAnimForSystem()
 end
 
 -- ======================
+-- ITEM LIST (for restriction picker)
+-- ======================
+local _itemOptionsCache = nil
+local _itemOptionsCacheAt = 0
+local ITEM_CACHE_MS = 60 * 1000 -- rebuild list every 60s
+
+local function BuildItemOptions()
+    -- cache to avoid rebuilding a huge list constantly
+    if _itemOptionsCache and (GetGameTimer() - _itemOptionsCacheAt) < ITEM_CACHE_MS then
+        return _itemOptionsCache
+    end
+
+    local opts = {}
+
+    -- 1) ox_inventory (preferred when running)
+    if HasRes('ox_inventory') and exports.ox_inventory and exports.ox_inventory.Items then
+        local ok, items = pcall(function()
+            return exports.ox_inventory:Items()
+        end)
+
+        if ok and type(items) == 'table' then
+            for name, data in pairs(items) do
+                local label = (data and data.label) or name
+                opts[#opts+1] = { label = (label .. " (" .. name .. ")"), value = name }
+            end
+        end
+    end
+
+    -- 2) QBCore.Shared.Items fallback
+    if #opts == 0 then
+        local items = (QBCore.Shared and QBCore.Shared.Items) or {}
+        for name, data in pairs(items) do
+            local label = (data and data.label) or name
+            opts[#opts+1] = { label = (label .. " (" .. name .. ")"), value = name }
+        end
+    end
+
+    table.sort(opts, function(a,b) return a.label < b.label end)
+
+    -- optional: add a "None" option at top
+    table.insert(opts, 1, { label = "None (no restriction)", value = "__none" })
+
+    _itemOptionsCache = opts
+    _itemOptionsCacheAt = GetGameTimer()
+    return opts
+end
+
+-- ======================
 -- PLAYER VISIBILITY (LOCAL ONLY)
 -- ======================
 local function ShowLocalPlayer()
@@ -207,9 +257,11 @@ local function EnsureHiddenLoop()
 
     CreateThread(function()
         while (menuOpen or camActive) do
-            local ped = PlayerPedId()
-            SetEntityLocallyInvisible(ped)
-            SetPlayerInvisibleLocally(PlayerId(), true)
+            if not allowVisibleWhileMenu then
+                local ped = PlayerPedId()
+                SetEntityLocallyInvisible(ped)
+                SetPlayerInvisibleLocally(PlayerId(), true)
+            end
             Wait(0)
         end
 
@@ -217,6 +269,7 @@ local function EnsureHiddenLoop()
         hiddenLoopRunning = false
     end)
 end
+
 
 local function HideLocalPlayer()
     local ped = PlayerPedId()
@@ -319,7 +372,6 @@ local function StopPreviewCam()
         SetCamActive(previewCam, false)
     end
 
-    -- hard stop scripted cams
     RenderScriptCams(false, false, 0, true, true)
     DestroyAllCams(true)
 
@@ -328,8 +380,9 @@ local function StopPreviewCam()
     camBenchId = nil
 
     ClearFocus()
-    ShowLocalPlayer()
+    -- DO NOT ShowLocalPlayer() here (menu/crafting decides visibility)
 end
+
 
 -- ======================
 -- FORCE STOP PREVIEW CAM ON ESC (while menu is open)
@@ -394,6 +447,32 @@ end
 -- ======================
 -- MENU HELPERS
 -- ======================
+
+local function ExitBenchMenuForProgress()
+    -- Close any UI (works even if CloseMenuUI isn't defined yet)
+    if HasRes('qb-menu') then
+        exports['qb-menu']:closeMenu()
+    end
+    if OX then
+        OX.hideContext()
+    end
+
+    -- Mark menu as closed so nothing restores cam/hide
+    menuOpen = false
+    activeBenchType = nil
+    activeBenchId = nil
+
+    -- Kill preview stuff
+    RemovePreviewProp()
+    StopPreviewCam()
+    camBenchId = nil
+    camActive = false
+
+    -- Make sure player is visible for progress
+    allowVisibleWhileMenu = true
+    ShowLocalPlayer()
+end
+
 local function CloseMenuUI()
     if MenuSystem == 'ox' and OX then
         OX.hideContext()
@@ -859,14 +938,16 @@ end
 -- BENCH RESTRICTION PROMPT (deny if player HAS item)
 -- ======================
 local function PromptBenchRestriction(cb)
-    -- OX input
-    if InputSystem == 'ox' and HAS_OX_LIB then
-        local input = lib.inputDialog('Bench Restriction (Optional)', {
+    local itemOpts = BuildItemOptions()
+
+    -- ---------- OX (ox_lib) ----------
+    if InputSystem == 'ox' and OX and OX.inputDialog then
+        local input = OX.inputDialog('Bench Restriction (Optional)', {
             {
-                type = 'input',
-                label = 'Restricted Item Name',
-                description = 'If a player HAS this item, they cannot use the bench. Leave blank for none.',
-                required = false
+                type = 'select',
+                label = 'Restricted Item (blocks if player HAS it)',
+                options = itemOpts,
+                required = true
             },
             {
                 type = 'number',
@@ -879,54 +960,81 @@ local function PromptBenchRestriction(cb)
         })
 
         if not input then
-            cb(nil) -- cancelled dialog entirely
+            cb(nil)
             return
         end
 
-        local item = (input[1] and tostring(input[1])) or ''
+        local picked = input[1]
         local amount = tonumber(input[2]) or 1
 
-        if item == '' then
+        if picked == "__none" then
             cb({ item = nil, amount = 1 })
         else
-            cb({ item = item, amount = math.max(1, amount) })
+            cb({ item = picked, amount = math.max(1, amount) })
         end
         return
     end
 
-    -- QB input
-    local r = exports['qb-input']:ShowInput({
-        header = 'Bench Restriction (Optional)',
-        submitText = 'Confirm',
-        inputs = {
-            {
-                text = 'Restricted item name (leave blank = none)',
-                name = 'restrictItem',
-                type = 'text',
-                isRequired = false
-            },
-            {
-                text = 'Restricted amount (default 1)',
-                name = 'restrictAmount',
-                type = 'number',
-                isRequired = false
-            }
-        }
-    })
+    -- ---------- QB fallback (qb-menu list) ----------
+    if HasRes('qb-menu') then
+        local menu = { { header = 'Bench Restriction (Optional)', isMenuHeader = true } }
 
-    if not r then
-        cb(nil) -- cancelled
+        for _, opt in ipairs(itemOpts) do
+            menu[#menu+1] = {
+                header = opt.label,
+                params = {
+                    event = 'JG-Crafting:client:_pickRestrictItem',
+                    args = { value = opt.value }
+                }
+            }
+        end
+
+        menu[#menu+1] = { header = 'Cancel', params = { event = 'JG-Crafting:client:_pickRestrictCancel' } }
+        exports['qb-menu']:openMenu(menu)
+
+        local function cleanup()
+            RemoveEventHandler(_G.__JG_RESTRICT_ITEM or 0)
+            RemoveEventHandler(_G.__JG_RESTRICT_CANCEL or 0)
+            _G.__JG_RESTRICT_ITEM = nil
+            _G.__JG_RESTRICT_CANCEL = nil
+        end
+
+        _G.__JG_RESTRICT_ITEM = AddEventHandler('JG-Crafting:client:_pickRestrictItem', function(data)
+            cleanup()
+
+            local picked = data and data.value
+            if not picked or picked == "__none" then
+                cb({ item = nil, amount = 1 })
+                return
+            end
+
+            -- ask amount (qb-input)
+            if HasRes('qb-input') then
+                local r = exports['qb-input']:ShowInput({
+                    header = 'Restricted Amount',
+                    submitText = 'Confirm',
+                    inputs = {
+                        { text = 'Amount (default 1)', name = 'amount', type = 'number', isRequired = false }
+                    }
+                })
+
+                local amt = (r and tonumber(r.amount)) or 1
+                cb({ item = picked, amount = math.max(1, amt) })
+            else
+                cb({ item = picked, amount = 1 })
+            end
+        end)
+
+        _G.__JG_RESTRICT_CANCEL = AddEventHandler('JG-Crafting:client:_pickRestrictCancel', function()
+            cleanup()
+            cb(nil)
+        end)
+
         return
     end
 
-    local item = (r.restrictItem and tostring(r.restrictItem)) or ''
-    local amount = tonumber(r.restrictAmount) or 1
-
-    if item == '' then
-        cb({ item = nil, amount = 1 })
-    else
-        cb({ item = item, amount = math.max(1, amount) })
-    end
+    -- no UI available
+    cb(nil)
 end
 
 -- ======================
@@ -1182,6 +1290,8 @@ local function StartBenchPlacement(benchType)
                     heading,
                     access.job,
                     access.minGrade,
+                    access.gang,
+                    access.gangGrade,
                     restrict.item,
                     restrict.amount
                 )
@@ -1497,18 +1607,30 @@ RegisterNetEvent('JG-Crafting:client:DoDismantle', function(data)
     local duration = per * amount
     if duration > 120000 then duration = 120000 end
 
-    HideLocalPlayer()
+    ExitBenchMenuForProgress() -- ✅ closes menu + kills cam + makes player visible
 
     local label = ('Dismantling %sx %s'):format(amount, (item.label or item.name))
 
     local function onFinish()
-        ShowLocalPlayer()
         TriggerServerEvent('JG-Crafting:server:DismantleItem', data)
+
+        -- ✅ progress ended, normal state (no menu restore)
+        allowVisibleWhileMenu = false
+        ShowLocalPlayer()
+        menuOpen = false
+        camActive = false
+        camBenchId = nil
     end
 
     local function onCancel()
-        ShowLocalPlayer()
         QBCore.Functions.Notify('Dismantling cancelled', 'error')
+
+        -- ✅ progress ended, normal state (no menu restore)
+        allowVisibleWhileMenu = false
+        ShowLocalPlayer()
+        menuOpen = false
+        camActive = false
+        camBenchId = nil
     end
 
     if ProgressSystem == 'ox' and OX and OX.progressCircle then
@@ -1567,11 +1689,25 @@ RegisterNetEvent('JG-Crafting:client:ProcessCraftQueue', function()
     isCrafting = true
 
     local data = table.remove(craftingQueue, 1)
-    HideLocalPlayer()
+    ExitBenchMenuForProgress()
+
+    RemovePreviewProp()
+    StopPreviewCam()
+    camBenchId = nil
+    camActive = false
+
+    allowVisibleWhileMenu = true
+    ShowLocalPlayer()
 
     local function finishSuccess()
-        ShowLocalPlayer()
         TriggerServerEvent('JG-Crafting:server:CraftItem', data)
+
+            allowVisibleWhileMenu = false
+            ShowLocalPlayer()
+            menuOpen = false
+            camActive = false
+            camBenchId = nil
+
         isCrafting = false
         if #craftingQueue > 0 then
             TriggerEvent('JG-Crafting:client:ProcessCraftQueue')
@@ -1579,8 +1715,14 @@ RegisterNetEvent('JG-Crafting:client:ProcessCraftQueue', function()
     end
 
     local function finishCancel()
-        ShowLocalPlayer()
         QBCore.Functions.Notify('Crafting cancelled', 'error')
+
+            allowVisibleWhileMenu = false
+            ShowLocalPlayer()
+            menuOpen = false
+            camActive = false
+            camBenchId = nil
+
         isCrafting = false
         if #craftingQueue > 0 then
             TriggerEvent('JG-Crafting:client:ProcessCraftQueue')
@@ -1717,7 +1859,7 @@ end
 -- LOAD FROM SERVER
 -- ======================
 local function RefreshBenches()
-    QBCore.Functions.TriggerCallback('qb-crafting:server:GetBenches', function(result)
+    QBCore.Functions.TriggerCallback('JG-Crafting:server:GetBenches', function(result)
         benches = result or {}
         SpawnBenches()
     end)
